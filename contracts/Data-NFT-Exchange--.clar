@@ -1,4 +1,4 @@
-(define-non-fungible-token data-nft uint)
+﻿(define-non-fungible-token data-nft uint)
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant ERR-OWNER-ONLY (err u100))
@@ -9,6 +9,8 @@
 (define-constant ERR-INVALID-ROYALTY (err u105))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u106))
 (define-constant ERR-LICENSE-EXPIRED (err u107))
+(define-constant ERR-SUBSCRIPTION-EXISTS (err u108))
+(define-constant ERR-INVALID-DURATION (err u109))
 
 (define-data-var token-id-nonce uint u0)
 (define-data-var platform-fee-rate uint u250)
@@ -37,6 +39,18 @@
 )
 
 (define-map user-royalties principal uint)
+
+(define-map dataset-subscriptions
+  {subscriber: principal, token-id: uint}
+  {
+    started-at: uint,
+    expires-at: uint,
+    monthly-fee: uint,
+    auto-renew: bool
+  }
+)
+
+(define-map subscription-earnings principal uint)
 
 (define-public (mint-dataset (name (string-ascii 50))
                            (description (string-ascii 200))
@@ -86,11 +100,9 @@
     )
     (asserts! (is-none existing-license) ERR-ALREADY-LICENSED)
     (asserts! (>= (stx-get-balance tx-sender) price) ERR-INSUFFICIENT-FUNDS)
-    
     (try! (stx-transfer? platform-fee tx-sender CONTRACT-OWNER))
     (try! (stx-transfer? creator-amount tx-sender creator))
     (try! (stx-transfer? royalty-amount tx-sender creator))
-    
     (map-set dataset-licenses license-key
       {
         licensed-at: current-block,
@@ -98,11 +110,9 @@
         price-paid: price
       }
     )
-    
     (map-set user-royalties creator 
       (+ (default-to u0 (map-get? user-royalties creator)) royalty-amount)
     )
-    
     (ok expires-at)
   )
 )
@@ -115,7 +125,6 @@
     )
     (asserts! (is-eq tx-sender token-owner) ERR-NOT-AUTHORIZED)
     (asserts! (> new-price u0) ERR-INVALID-PRICE)
-    
     (map-set token-metadata token-id
       (merge token-data {price: new-price})
     )
@@ -149,6 +158,93 @@
     (try! (as-contract (stx-transfer? royalty-balance tx-sender tx-sender)))
     (map-delete user-royalties tx-sender)
     (ok royalty-balance)
+  )
+)
+
+(define-public (subscribe-to-dataset (token-id uint) (monthly-fee uint) (duration-months uint))
+  (let
+    (
+      (subscription-key {subscriber: tx-sender, token-id: token-id})
+      (existing-subscription (map-get? dataset-subscriptions subscription-key))
+      (current-block stacks-block-height)
+      (duration-blocks (* duration-months u4320))
+      (expires-at (+ current-block duration-blocks))
+      (total-cost (* monthly-fee duration-months))
+      (token-data (unwrap! (map-get? token-metadata token-id) ERR-TOKEN-NOT-FOUND))
+      (creator (get creator token-data))
+      (platform-fee (/ (* total-cost (var-get platform-fee-rate)) u10000))
+      (creator-amount (- total-cost platform-fee))
+    )
+    (asserts! (> monthly-fee u0) ERR-INVALID-PRICE)
+    (asserts! (and (>= duration-months u1) (<= duration-months u12)) ERR-INVALID-DURATION)
+    (asserts! (is-none existing-subscription) ERR-SUBSCRIPTION-EXISTS)
+    (asserts! (>= (stx-get-balance tx-sender) total-cost) ERR-INSUFFICIENT-FUNDS)
+    (try! (stx-transfer? platform-fee tx-sender CONTRACT-OWNER))
+    (try! (stx-transfer? creator-amount tx-sender creator))
+    (map-set dataset-subscriptions subscription-key
+      {
+        started-at: current-block,
+        expires-at: expires-at,
+        monthly-fee: monthly-fee,
+        auto-renew: false
+      }
+    )
+    (map-set subscription-earnings creator
+      (+ (default-to u0 (map-get? subscription-earnings creator)) creator-amount)
+    )
+    (ok expires-at)
+  )
+)
+
+(define-public (renew-subscription (token-id uint) (duration-months uint))
+  (let
+    (
+      (subscription-key {subscriber: tx-sender, token-id: token-id})
+      (subscription (unwrap! (map-get? dataset-subscriptions subscription-key) ERR-TOKEN-NOT-FOUND))
+      (monthly-fee (get monthly-fee subscription))
+      (total-cost (* monthly-fee duration-months))
+      (duration-blocks (* duration-months u4320))
+      (current-block stacks-block-height)
+      (new-expires-at (+ current-block duration-blocks))
+      (token-data (unwrap! (map-get? token-metadata token-id) ERR-TOKEN-NOT-FOUND))
+      (creator (get creator token-data))
+      (platform-fee (/ (* total-cost (var-get platform-fee-rate)) u10000))
+      (creator-amount (- total-cost platform-fee))
+    )
+    (asserts! (and (>= duration-months u1) (<= duration-months u12)) ERR-INVALID-DURATION)
+    (asserts! (>= (stx-get-balance tx-sender) total-cost) ERR-INSUFFICIENT-FUNDS)
+    (try! (stx-transfer? platform-fee tx-sender CONTRACT-OWNER))
+    (try! (stx-transfer? creator-amount tx-sender creator))
+    (map-set dataset-subscriptions subscription-key
+      (merge subscription {expires-at: new-expires-at})
+    )
+    (map-set subscription-earnings creator
+      (+ (default-to u0 (map-get? subscription-earnings creator)) creator-amount)
+    )
+    (ok new-expires-at)
+  )
+)
+
+(define-public (cancel-subscription (token-id uint))
+  (let
+    (
+      (subscription-key {subscriber: tx-sender, token-id: token-id})
+    )
+    (asserts! (is-some (map-get? dataset-subscriptions subscription-key)) ERR-TOKEN-NOT-FOUND)
+    (map-delete dataset-subscriptions subscription-key)
+    (ok true)
+  )
+)
+
+(define-public (withdraw-subscription-earnings)
+  (let
+    (
+      (earnings (default-to u0 (map-get? subscription-earnings tx-sender)))
+    )
+    (asserts! (> earnings u0) ERR-INSUFFICIENT-FUNDS)
+    (try! (as-contract (stx-transfer? earnings tx-sender tx-sender)))
+    (map-delete subscription-earnings tx-sender)
+    (ok earnings)
   )
 )
 
@@ -223,12 +319,34 @@
   (ok "Use external indexer")
 )
 
+(define-read-only (get-subscription (subscriber principal) (token-id uint))
+  (map-get? dataset-subscriptions {subscriber: subscriber, token-id: token-id})
+)
+
+(define-read-only (is-subscription-active (subscriber principal) (token-id uint))
+  (let
+    (
+      (subscription (map-get? dataset-subscriptions {subscriber: subscriber, token-id: token-id}))
+      (current-block stacks-block-height)
+    )
+    (match subscription
+      sub (< current-block (get expires-at sub))
+      false
+    )
+  )
+)
+
+(define-read-only (get-subscription-earnings (creator principal))
+  (default-to u0 (map-get? subscription-earnings creator))
+)
+
 (define-read-only (verify-dataset-access (token-id uint) (user principal))
   (let
     (
       (is-owner (is-eq (some user) (nft-get-owner? data-nft token-id)))
       (has-valid-license (is-license-valid token-id user))
+      (has-active-subscription (is-subscription-active user token-id))
     )
-    (or is-owner has-valid-license)
+    (or is-owner (or has-valid-license has-active-subscription))
   )
 )
