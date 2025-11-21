@@ -29,6 +29,11 @@
   }
 )
 
+(define-map token-uris
+  uint
+  (string-ascii 200)
+)
+
 (define-map dataset-licenses
   {token-id: uint, licensee: principal}
   {
@@ -257,7 +262,7 @@
 )
 
 (define-read-only (get-token-uri (token-id uint))
-  (ok none)
+  (ok (map-get? token-uris token-id))
 )
 
 (define-read-only (get-dataset-metadata (token-id uint))
@@ -338,6 +343,17 @@
 
 (define-read-only (get-subscription-earnings (creator principal))
   (default-to u0 (map-get? subscription-earnings creator))
+)
+
+(define-public (set-token-uri (token-id uint) (uri (string-ascii 200)))
+  (let
+    (
+      (token-owner (unwrap! (nft-get-owner? data-nft token-id) ERR-TOKEN-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR-NOT-AUTHORIZED)
+    (map-set token-uris token-id uri)
+    (ok true)
+  )
 )
 
 (define-read-only (verify-dataset-access (token-id uint) (user principal))
